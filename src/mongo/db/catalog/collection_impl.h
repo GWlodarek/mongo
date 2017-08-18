@@ -364,6 +364,11 @@ public:
                              const IndexKeyEntry& indexEntry,
                              const ValidationOperation operation) const;
 
+    /**
+     * Stops background validation if it was running on the collection.
+     */
+    void stopBackgroundValidation() const;
+
 
 private:
     inline DatabaseCatalogEntry* dbce() const final {
@@ -434,6 +439,9 @@ private:
 
     mutable stdx::mutex _indexObserverMutex;
     mutable std::unique_ptr<IndexObserver> _indexObserver;
+
+    mutable stdx::mutex _indexConsistencyMutex;
+    mutable IndexConsistency* _indexConsistency = nullptr;
 
     // The default collation which is applied to operations and indices which have no collation of
     // their own. The collection's validator will respect this collation.

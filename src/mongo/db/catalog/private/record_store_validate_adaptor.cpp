@@ -35,6 +35,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_consistency.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher/expression.h"
@@ -42,9 +43,69 @@
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/rpc/object_check.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+namespace {
+
+void processIndexEntry(IndexConsistency* indexConsistency,
+                       const KeyString* indexKeyString,
+                       const KeyString* prevIndexKeyString,
+                       bool isFirstEntry,
+                       int64_t* numKeys,
+                       int64_t indexNumber,
+                       ValidateResults* results) {
+
+    // Ensure that the index entries are in increasing or decreasing order.
+    if (!isFirstEntry && *indexKeyString < *prevIndexKeyString) {
+        if (results->valid) {
+            results->errors.push_back(
+                "one or more indexes are not in strictly ascending or descending "
+                "order");
+        }
+        results->valid = false;
+    }
+
+    indexConsistency->addIndexKey(*indexKeyString, indexNumber);
+    (*numKeys)++;
+}
+
+void processRecord(RecordStoreValidateAdaptor* adaptor,
+                   const boost::optional<Record>& curRecord,
+                   const RecordId& prevRecordId,
+                   int64_t* nrecords,
+                   int64_t* dataSizeTotal,
+                   int64_t* nInvalid,
+                   ValidateResults* results) {
+
+    ++(*nrecords);
+
+    auto dataSize = curRecord->data.size();
+    (*dataSizeTotal) += dataSize;
+    size_t validatedSize;
+    Status status = adaptor->validate(curRecord->id, curRecord->data, &validatedSize);
+
+    // Checks to ensure isInRecordIdOrder() is being used properly.
+    if (prevRecordId.isNormal()) {
+        invariant(prevRecordId < curRecord->id);
+    }
+
+    // While some storage engines, such as MMAPv1, may use padding, we still require
+    // that they return the unpadded record data.
+    if (!status.isOK() || validatedSize != static_cast<size_t>(dataSize)) {
+        if (results->valid) {
+            // Only log once.
+            results->errors.push_back("detected one or more invalid documents (see logs)");
+        }
+        (*nInvalid)++;
+        results->valid = false;
+        log() << "document at location: " << curRecord->id << " is corrupted";
+    }
+}
+}  // namespace
 
 Status RecordStoreValidateAdaptor::validate(const RecordId& recordId,
                                             const RecordData& record,
@@ -119,11 +180,23 @@ Status RecordStoreValidateAdaptor::validate(const RecordId& recordId,
 
 void RecordStoreValidateAdaptor::traverseIndex(const IndexAccessMethod* iam,
                                                const IndexDescriptor* descriptor,
+                                               bool background,
                                                ValidateResults* results,
                                                int64_t* numTraversedKeys) {
+
+    invariant(_opCtx->lockState()->isCollectionLockedForMode(_nss.toString(), LockMode::MODE_X));
+
     auto indexNs = descriptor->indexNamespace();
     int indexNumber = _indexConsistency->getIndexNumber(indexNs);
     int64_t numKeys = 0;
+
+    if (background) {
+        // Notify the IndexConsistency instance that we're starting to scan a new index.
+        _indexConsistency->notifyStartIndex(indexNumber);
+
+        // Yield to get the latest snapshot before we begin scanning through the index.
+        _indexConsistency->yield();
+    }
 
     const auto& key = descriptor->keyPattern();
     const Ordering ord = Ordering::make(key);
@@ -131,31 +204,171 @@ void RecordStoreValidateAdaptor::traverseIndex(const IndexAccessMethod* iam,
     std::unique_ptr<KeyString> prevIndexKeyString = nullptr;
     bool isFirstEntry = true;
 
-    std::unique_ptr<SortedDataInterface::Cursor> cursor = iam->newCursor(_opCtx, true);
-    // Seeking to BSONObj() is equivalent to seeking to the first entry of an index.
-    for (auto indexEntry = cursor->seek(BSONObj(), true); indexEntry; indexEntry = cursor->next()) {
+    int interruptInterval = 4096;
+    boost::optional<IndexKeyEntry> currentIndexEntry = boost::none;
 
-        // We want to use the latest version of KeyString here.
-        std::unique_ptr<KeyString> indexKeyString =
-            stdx::make_unique<KeyString>(version, indexEntry->key, ord, indexEntry->loc);
-        // Ensure that the index entries are in increasing or decreasing order.
-        if (!isFirstEntry && *indexKeyString < *prevIndexKeyString) {
-            if (results->valid) {
-                results->errors.push_back(
-                    "one or more indexes are not in strictly ascending or descending "
-                    "order");
+    std::unique_ptr<SortedDataInterface::Cursor> cursor = iam->newCursor(_opCtx, true);
+    std::unique_ptr<SortedDataInterface::Cursor> lookAheadCursor = iam->newCursor(_opCtx, true);
+
+    if (background) {
+        // Allow concurrent read/writes to happen.
+        _indexConsistency->relockCollectionWithMode(LockMode::MODE_IX);
+    }
+
+    // `shouldYield` will be true if we hit the periodic yield point to allow other operations
+    // requiring locks to run.
+    bool shouldYield = false;
+
+    bool isEOF = false;
+    while (!isEOF) {
+
+        std::unique_ptr<KeyString> indexKeyString = nullptr;
+
+        // `consumeAndReposition` will move the `cursor` forward once we get a new snapshot and
+        // move the `lookAheadCursor` back to where `cursor` is. After that, we will process the
+        // index entry.
+        bool consumeAndReposition = false;
+        if (!shouldYield) {
+
+            boost::optional<IndexKeyEntry> lookAheadIndexEntry = boost::none;
+            if (isFirstEntry) {
+                // Seeking to BSONObj() is equivalent to seeking to the first entry of an index.
+                lookAheadIndexEntry = lookAheadCursor->seek(BSONObj(), true);
+            } else {
+                lookAheadIndexEntry = lookAheadCursor->next();
             }
-            results->valid = false;
+
+            if (!lookAheadIndexEntry) {
+                isEOF = true;
+
+                if (!background) {
+                    // Non-background validation exits here.
+                    continue;
+                }
+            } else {
+
+                // We want to use the latest version of KeyString here.
+                indexKeyString.reset(new KeyString(
+                    version, lookAheadIndexEntry->key, ord, lookAheadIndexEntry->loc));
+
+                // Checks to see if we should get a new snapshot or we can continue using this
+                // snapshot because of our cursor placement.
+                bool shouldGetNext = _indexConsistency->shouldGetNext(*indexKeyString);
+                if (!shouldGetNext) {
+                    shouldYield = true;
+                    consumeAndReposition = true;
+                } else {
+                    // The look ahead cursor saw something, so we can safely move up our cursor up.
+                    if (isFirstEntry) {
+                        // Seeking to BSONObj() is equivalent to seeking to the first entry of an
+                        // index.
+                        currentIndexEntry = cursor->seek(BSONObj(), true);
+                    } else {
+                        currentIndexEntry = cursor->next();
+                    }
+                }
+            }
         }
 
-        _indexConsistency->addIndexKey(*indexKeyString, indexNumber);
+        if (background && (isEOF || shouldYield)) {
 
-        numKeys++;
+            // Switch to MODE_X to prohibit concurrency.
+            _indexConsistency->relockCollectionWithMode(LockMode::MODE_X);
+
+            // Save the cursor as we'll be abandoning the snapshot.
+            cursor->save();
+            lookAheadCursor->save();
+
+            // We yield to get a new snapshot to be able to gather any records that may
+            // have been added while we were waiting for get the MODE_X lock.
+            _indexConsistency->yield();
+
+            // Restore the cursor in the new snapshot.
+            // If the `prevRecordId` that the cursor is pointing to gets removed in the
+            // new snapshot, the call to next() will return the next closest position.
+            cursor->restore();
+            lookAheadCursor->restore();
+
+            if (consumeAndReposition) {
+
+                currentIndexEntry = cursor->next();
+                if (!currentIndexEntry) {
+                    isEOF = true;
+                } else {
+                    indexKeyString.reset(new KeyString(
+                        version, currentIndexEntry->key, ord, currentIndexEntry->loc));
+
+                    // This will always return true as we just yielded and are in MODE_X.
+                    _indexConsistency->shouldGetNext(*indexKeyString);
+
+                    boost::optional<IndexKeyEntry> lookAheadIndexEntry =
+                        lookAheadCursor->seekExact(currentIndexEntry->key);
+                    while (currentIndexEntry->loc != lookAheadIndexEntry->loc) {
+                        lookAheadIndexEntry = lookAheadCursor->next();
+                    }
+                }
+            }
+
+            if (isEOF) {
+                continue;
+            }
+
+            // Switch back to a MODE_IX lock to allow concurrency.
+            _indexConsistency->relockCollectionWithMode(LockMode::MODE_IX);
+
+            if (shouldYield && !consumeAndReposition) {
+                shouldYield = false;
+                continue;
+            }
+        }
+
+        // Process the current index entry and prepare for the next iteration.
+        processIndexEntry(_indexConsistency,
+                          indexKeyString.get(),
+                          prevIndexKeyString.get(),
+                          isFirstEntry,
+                          &numKeys,
+                          indexNumber,
+                          results);
+
+        isFirstEntry = false;
+        prevIndexKeyString.swap(indexKeyString);
+
+        if (!(numKeys % interruptInterval)) {
+            _opCtx->checkForInterrupt();
+        }
+
+        // Called last to ensure we don't end up in the loop forever.
+        shouldYield = _indexConsistency->scanLimitHit();
+    }
+
+    invariant(_opCtx->lockState()->isCollectionLockedForMode(_nss.toString(), LockMode::MODE_X));
+
+    while (((isFirstEntry) ? currentIndexEntry = cursor->seek(BSONObj(), true)
+                           : currentIndexEntry = cursor->next())) {
+
+        std::unique_ptr<KeyString> indexKeyString = nullptr;
+        indexKeyString.reset(
+            new KeyString(version, currentIndexEntry->key, ord, currentIndexEntry->loc));
+
+        // Process the current index entry and prepare for the next iteration.
+        processIndexEntry(_indexConsistency,
+                          indexKeyString.get(),
+                          prevIndexKeyString.get(),
+                          isFirstEntry,
+                          &numKeys,
+                          indexNumber,
+                          results);
+
         isFirstEntry = false;
         prevIndexKeyString.swap(indexKeyString);
     }
 
-    *numTraversedKeys = numKeys;
+    *numTraversedKeys = _indexConsistency->getNumKeys(indexNumber);
+
+    if (background) {
+        _indexConsistency->notifyDoneIndex(indexNumber);
+    }
 }
 
 void RecordStoreValidateAdaptor::traverseRecordStore(RecordStore* recordStore,
@@ -163,53 +376,131 @@ void RecordStoreValidateAdaptor::traverseRecordStore(RecordStore* recordStore,
                                                      ValidateResults* results,
                                                      BSONObjBuilder* output) {
 
-    long long nrecords = 0;
-    long long dataSizeTotal = 0;
-    long long nInvalid = 0;
+    invariant(_opCtx->lockState()->isCollectionLockedForMode(_nss.toString(), LockMode::MODE_X));
+
+    int64_t nrecords = 0;
+    int64_t dataSizeTotal = 0;
+    int64_t nInvalid = 0;
 
     results->valid = true;
     std::unique_ptr<SeekableRecordCursor> cursor = recordStore->getCursor(_opCtx, true);
+    std::unique_ptr<SeekableRecordCursor> lookAheadCursor = recordStore->getCursor(_opCtx, true);
     int interruptInterval = 4096;
+
+    boost::optional<Record> curRecord = boost::none;
     RecordId prevRecordId;
 
-    while (auto record = cursor->next()) {
-        ++nrecords;
+    // Allow concurrent read/writes to happen.
+    _indexConsistency->relockCollectionWithMode(LockMode::MODE_IX);
+
+    // `shouldYield` will be true if we hit the periodic yield point to allow other operations
+    // requiring locks to run.
+    bool shouldYield = false;
+
+    bool isEOF = false;
+    while (!isEOF) {
+
+        // `consumeAndReposition` will move the `cursor` forward once we get a new snapshot and
+        // move the `lookAheadCursor` back to where `cursor` is. After that, we will process the
+        // record.
+        bool consumeAndReposition = false;
+        if (!shouldYield) {
+            boost::optional<Record> lookAheadRecord = lookAheadCursor->next();
+            if (!lookAheadRecord) {
+                isEOF = true;
+            } else {
+
+                // Checks to see if we should get a new snapshot or we can continue using this
+                // snapshot because of our cursor placement.
+                bool shouldGetNext = _indexConsistency->shouldGetNext(lookAheadRecord->id);
+                if (!shouldGetNext) {
+                    shouldYield = true;
+                    consumeAndReposition = true;
+                } else {
+                    // The look ahead cursor saw something, so we can safely move up our cursor up.
+                    curRecord = cursor->next();
+                }
+            }
+        }
+
+        if (isEOF || shouldYield) {
+
+            // Switch to MODE_X to prohibit concurrency.
+            _indexConsistency->relockCollectionWithMode(LockMode::MODE_X);
+
+            // Save the cursor as we'll be abandoning the snapshot.
+            cursor->save();
+            lookAheadCursor->save();
+
+            // We yield to get a new snapshot to be able to gather any records that may
+            // have been added while we were waiting for get the MODE_X lock.
+            _indexConsistency->yield();
+
+            // Restore the cursor in the new snapshot.
+            // If the `prevRecordId` that the cursor is pointing to gets removed in the
+            // new snapshot, the call to next() will return the next closest position.
+            // If the cursor returns false, then the colletion object has been changed.
+            bool cursorRestore = cursor->restore();
+            uassert(40614, "Background validation was interrupted", cursorRestore);
+            bool lookAheadCursorRestore = lookAheadCursor->restore();
+            uassert(40615, "Background validation was interrupted", lookAheadCursorRestore);
+
+            if (consumeAndReposition) {
+                curRecord = cursor->next();
+                if (!curRecord) {
+                    isEOF = true;
+                } else {
+                    // This will always return true as we just yielded and are in MODE_X.
+                    _indexConsistency->shouldGetNext(curRecord->id);
+
+                    lookAheadCursor->seekExact(curRecord->id);
+                }
+            }
+
+            if (isEOF) {
+                continue;
+            }
+
+            // Switch back to a MODE_IX lock to allow concurrency.
+            _indexConsistency->relockCollectionWithMode(LockMode::MODE_IX);
+
+            if (shouldYield && !consumeAndReposition) {
+                shouldYield = false;
+                continue;
+            }
+        }
+
+        // Process the current record and prepare for the next iteration.
+        processRecord(this, curRecord, prevRecordId, &nrecords, &dataSizeTotal, &nInvalid, results);
+        prevRecordId = curRecord->id;
 
         if (!(nrecords % interruptInterval)) {
             _opCtx->checkForInterrupt();
         }
 
-        auto dataSize = record->data.size();
-        dataSizeTotal += dataSize;
-        size_t validatedSize;
-        Status status = validate(record->id, record->data, &validatedSize);
-
-        // Checks to ensure isInRecordIdOrder() is being used properly.
-        if (prevRecordId.isNormal()) {
-            invariant(prevRecordId < record->id);
-        }
-
-        // While some storage engines, such as MMAPv1, may use padding, we still require
-        // that they return the unpadded record data.
-        if (!status.isOK() || validatedSize != static_cast<size_t>(dataSize)) {
-            if (results->valid) {
-                // Only log once.
-                results->errors.push_back("detected one or more invalid documents (see logs)");
-            }
-            nInvalid++;
-            results->valid = false;
-            log() << "document at location: " << record->id << " is corrupted";
-        }
-
-        prevRecordId = record->id;
+        // Called last to ensure we don't end up in the loop forever.
+        shouldYield = _indexConsistency->scanLimitHit();
     }
+
+    invariant(_opCtx->lockState()->isCollectionLockedForMode(_nss.toString(), LockMode::MODE_X));
+
+    while ((curRecord = cursor->next())) {
+
+        // Process the current record and prepare for the next iteration.
+        processRecord(this, curRecord, prevRecordId, &nrecords, &dataSizeTotal, &nInvalid, results);
+        prevRecordId = curRecord->id;
+    }
+
+    nrecords += _indexConsistency->getNumRecordChangesBeforeCursor(&dataSizeTotal);
+
+    _indexConsistency->nextStage();
 
     if (results->valid) {
         recordStore->updateStatsAfterRepair(_opCtx, nrecords, dataSizeTotal);
     }
 
-    output->append("nInvalidDocuments", nInvalid);
-    output->appendNumber("nrecords", nrecords);
+    output->append("nInvalidDocuments", static_cast<long long>(nInvalid));
+    output->appendNumber("nrecords", static_cast<long long>(nrecords));
 }
 
 void RecordStoreValidateAdaptor::validateIndexKeyCount(IndexDescriptor* idx,

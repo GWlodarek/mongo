@@ -284,6 +284,10 @@ public:
         std::abort();
     }
 
+    void stopBackgroundValidation() const {
+        std::abort();
+    }
+
     OptionalCollectionUUID uuid() const {
         std::abort();
     }

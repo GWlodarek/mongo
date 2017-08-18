@@ -231,6 +231,7 @@ jsTestOptions = function() {
             networkMessageCompressors: TestData.networkMessageCompressors,
             skipValidationOnInvalidViewDefinitions: TestData.skipValidationOnInvalidViewDefinitions,
             skipCollectionAndIndexValidation: TestData.skipCollectionAndIndexValidation,
+            useBackgroundValidation: TestData.useBackgroundValidation || false,
             // We default skipValidationOnNamespaceNotFound to true because mongod can end up
             // dropping a collection after calling listCollections (e.g. if a secondary applies an
             // oplog entry).

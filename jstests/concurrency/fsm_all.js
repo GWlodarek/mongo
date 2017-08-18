@@ -8,6 +8,11 @@ var blacklist = [].map(function(file) {
     return dir + '/' + file;
 });
 
-runWorkloadsSerially(ls(dir).filter(function(file) {
-    return !Array.contains(blacklist, file);
-}));
+runWorkloadsSerially(
+    ls(dir).filter(function(file) {
+        return !Array.contains(blacklist, file);
+    }),
+    {sameCollection: true},
+    {
+      backgroundWorkloads: ['jstests/concurrency/fsm_background_workloads/background_validation.js']
+    });

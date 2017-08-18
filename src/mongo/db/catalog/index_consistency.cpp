@@ -28,9 +28,12 @@
 
 #include <third_party/murmurhash3/MurmurHash3.h>
 
+#include "mongo/db/catalog/private/record_store_validate_adaptor.h"
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_consistency.h"
@@ -61,6 +64,7 @@ IndexConsistency::IndexConsistency(OperationContext* opCtx,
       _recordStore(recordStore),
       _collLk(std::move(collLk)),
       _isBackground(background),
+      _uuid(collection->uuid()),
       _tracker(opCtx->getServiceContext()->getFastClockSource(),
                internalQueryExecYieldIterations.load(),
                Milliseconds(internalQueryExecYieldPeriodMS.load())) {
@@ -88,8 +92,7 @@ IndexConsistency::IndexConsistency(OperationContext* opCtx,
 
         indexInfo.numKeys = 0;
         indexInfo.numLongKeys = 0;
-        indexInfo.numRecords = 0;
-        indexInfo.numExtraIndexKeys = 0;
+        indexInfo.numRecordKeys = 0;
 
         _indexesInfo[indexNumber] = indexInfo;
 
@@ -144,7 +147,7 @@ void IndexConsistency::addLongIndexKey(int indexNumber) {
         return;
     }
 
-    _indexesInfo[indexNumber].numRecords++;
+    _indexesInfo[indexNumber].numRecordKeys++;
     _indexesInfo[indexNumber].numLongKeys++;
 }
 
@@ -168,14 +171,35 @@ int64_t IndexConsistency::getNumLongKeys(int indexNumber) const {
     return _indexesInfo.at(indexNumber).numLongKeys;
 }
 
-int64_t IndexConsistency::getNumRecords(int indexNumber) const {
+int64_t IndexConsistency::getNumRecordKeys(int indexNumber) const {
 
     stdx::lock_guard<stdx::mutex> lock(_classMutex);
     if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
         return 0;
     }
 
-    return _indexesInfo.at(indexNumber).numRecords;
+    return _indexesInfo.at(indexNumber).numRecordKeys;
+}
+
+int64_t IndexConsistency::getNumRecordChangesBeforeCursor(int64_t* totalDataSize) {
+
+    stdx::lock_guard<stdx::mutex> lock(_classMutex);
+    *totalDataSize = *totalDataSize + _dataSizeChanges;
+    return _numRecordChanges;
+}
+
+void IndexConsistency::processRecordBeforeCursor(const RecordId& loc, int size, bool increment) {
+
+    stdx::lock_guard<stdx::mutex> lock(_classMutex);
+    if (_isBeforeLastProcessedRecordId_inlock(loc)) {
+        if (increment) {
+            _numRecordChanges += 1;
+            _dataSizeChanges += size;
+        } else {
+            _numRecordChanges -= 1;
+            _dataSizeChanges -= size;
+        }
+    }
 }
 
 bool IndexConsistency::haveEntryMismatch() const {
@@ -188,16 +212,6 @@ bool IndexConsistency::haveEntryMismatch() const {
     }
 
     return false;
-}
-
-int64_t IndexConsistency::getNumExtraIndexKeys(int indexNumber) const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return 0;
-    }
-
-    return _indexesInfo.at(indexNumber).numExtraIndexKeys;
 }
 
 void IndexConsistency::applyChange(const IndexDescriptor* descriptor,
@@ -224,14 +238,14 @@ void IndexConsistency::applyChange(const IndexDescriptor* descriptor,
     KeyString ks(version, indexEntry->key, ord, indexEntry->loc);
 
     if (_stage == ValidationStage::DOCUMENT) {
-        _setYieldAtRecord_inlock(indexEntry->loc);
+        _setYieldAtRecordId_inlock(indexEntry->loc);
         if (_isBeforeLastProcessedRecordId_inlock(indexEntry->loc)) {
             if (operation == ValidationOperation::INSERT) {
                 if (indexEntry->key.objsize() >=
                     static_cast<int64_t>(KeyString::TypeBits::kMaxKeyBytes)) {
                     // Index keys >= 1024 bytes are not indexed but are stored in the document key
                     // set.
-                    _indexesInfo[indexNumber].numRecords++;
+                    _indexesInfo[indexNumber].numRecordKeys++;
                     _indexesInfo[indexNumber].numLongKeys++;
                 } else {
                     _addDocKey_inlock(ks, indexNumber);
@@ -239,7 +253,7 @@ void IndexConsistency::applyChange(const IndexDescriptor* descriptor,
             } else if (operation == ValidationOperation::REMOVE) {
                 if (indexEntry->key.objsize() >=
                     static_cast<int64_t>(KeyString::TypeBits::kMaxKeyBytes)) {
-                    _indexesInfo[indexNumber].numRecords--;
+                    _indexesInfo[indexNumber].numRecordKeys--;
                     _indexesInfo[indexNumber].numLongKeys--;
                 } else {
                     _removeDocKey_inlock(ks, indexNumber);
@@ -269,15 +283,12 @@ void IndexConsistency::applyChange(const IndexDescriptor* descriptor,
             // and an event occured after our cursor
             if (operation == ValidationOperation::INSERT) {
                 _removeIndexKey_inlock(ks, indexNumber);
-                _indexesInfo.at(indexNumber).numExtraIndexKeys++;
             } else if (operation == ValidationOperation::REMOVE) {
                 _addIndexKey_inlock(ks, indexNumber);
-                _indexesInfo.at(indexNumber).numExtraIndexKeys--;
             }
         }
     }
 }
-
 
 void IndexConsistency::nextStage() {
 
@@ -293,32 +304,6 @@ ValidationStage IndexConsistency::getStage() const {
 
     stdx::lock_guard<stdx::mutex> lock(_classMutex);
     return _stage;
-}
-
-void IndexConsistency::setLastProcessedRecordId(RecordId recordId) {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (!recordId.isNormal()) {
-        _lastProcessedRecordId = boost::none;
-    } else {
-        _lastProcessedRecordId = recordId;
-    }
-}
-
-void IndexConsistency::setLastProcessedIndexEntry(
-    const IndexDescriptor& descriptor, const boost::optional<IndexKeyEntry>& indexEntry) {
-
-    const auto& key = descriptor.keyPattern();
-    const Ordering ord = Ordering::make(key);
-    KeyString::Version version = KeyString::kLatestVersion;
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (!indexEntry) {
-        _lastProcessedIndexEntry.reset();
-    } else {
-        _lastProcessedIndexEntry.reset(
-            new KeyString(version, indexEntry->key, ord, indexEntry->loc));
-    }
 }
 
 void IndexConsistency::notifyStartIndex(int indexNumber) {
@@ -354,24 +339,30 @@ int IndexConsistency::getIndexNumber(const std::string& indexNs) {
     return -1;
 }
 
-bool IndexConsistency::shouldGetNewSnapshot(const RecordId recordId) const {
+bool IndexConsistency::shouldGetNext(const RecordId recordId) {
 
     stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (!_yieldAtRecordId) {
+    if (_yieldAtRecordId && _yieldAtRecordId <= recordId) {
         return false;
     }
 
-    return _yieldAtRecordId <= recordId;
+    _lastProcessedRecordId = recordId;
+
+    return true;
 }
 
-bool IndexConsistency::shouldGetNewSnapshot(const KeyString& keyString) const {
+bool IndexConsistency::shouldGetNext(const KeyString& keyString) {
 
     stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (!_yieldAtIndexEntry) {
+    if (_yieldAtIndexEntry && *_yieldAtIndexEntry <= keyString) {
         return false;
     }
 
-    return *_yieldAtIndexEntry <= keyString;
+    KeyString::Version version = KeyString::kLatestVersion;
+    _lastProcessedIndexEntry.reset(new KeyString(version));
+    _lastProcessedIndexEntry->resetFromBuffer(keyString.getBuffer(), keyString.getSize());
+
+    return true;
 }
 
 void IndexConsistency::relockCollectionWithMode(LockMode mode) {
@@ -380,11 +371,11 @@ void IndexConsistency::relockCollectionWithMode(LockMode mode) {
     _collLk.reset(new Lock::CollectionLock(_opCtx->lockState(), _nss.toString(), mode));
     invariant(_opCtx->lockState()->isCollectionLockedForMode(_nss.toString(), mode));
 
+    // Ensure it is safe to continue.
+    uassertStatusOK(_canProceed());
+
     // Check if the operation was killed.
     _opCtx->checkForInterrupt();
-
-    // Ensure it is safe to continue.
-    uassertStatusOK(_throwExceptionIfError());
 }
 
 bool IndexConsistency::scanLimitHit() {
@@ -406,14 +397,20 @@ void IndexConsistency::yield() {
     QueryYield::yieldAllLocks(_opCtx, nullptr, _nss);
     lock.lock();
 
+    // Ensure it is safe to continue.
+    uassertStatusOK(_canProceed());
+
     // Check if the operation was killed.
     _opCtx->checkForInterrupt();
 
     _yieldAtRecordId = boost::none;
     _yieldAtIndexEntry.reset();
+}
 
-    // Ensure it is safe to continue.
-    uassertStatusOK(_throwExceptionIfError());
+void IndexConsistency::stop() {
+
+    stdx::unique_lock<stdx::mutex> lock(_classMutex);
+    _shouldStopValidation = true;
 }
 
 void IndexConsistency::_addDocKey_inlock(const KeyString& ks, int indexNumber) {
@@ -425,7 +422,7 @@ void IndexConsistency::_addDocKey_inlock(const KeyString& ks, int indexNumber) {
 
     const uint32_t hash = _hashKeyString(ks, indexNumber);
     _indexKeyCount[hash]++;
-    _indexesInfo.at(indexNumber).numRecords++;
+    _indexesInfo.at(indexNumber).numRecordKeys++;
 }
 
 void IndexConsistency::_removeDocKey_inlock(const KeyString& ks, int indexNumber) {
@@ -437,7 +434,7 @@ void IndexConsistency::_removeDocKey_inlock(const KeyString& ks, int indexNumber
 
     const uint32_t hash = _hashKeyString(ks, indexNumber);
     _indexKeyCount[hash]--;
-    _indexesInfo.at(indexNumber).numRecords--;
+    _indexesInfo.at(indexNumber).numRecordKeys--;
 }
 
 void IndexConsistency::_addIndexKey_inlock(const KeyString& ks, int indexNumber) {
@@ -474,7 +471,7 @@ bool IndexConsistency::_isIndexScanning_inlock(int indexNumber) const {
     return indexNumber == _currentIndex;
 }
 
-void IndexConsistency::_setYieldAtRecord_inlock(const RecordId recordId) {
+void IndexConsistency::_setYieldAtRecordId_inlock(const RecordId recordId) {
 
     if (_isBeforeLastProcessedRecordId_inlock(recordId)) {
         return;
@@ -525,7 +522,11 @@ uint32_t IndexConsistency::_hashKeyString(const KeyString& ks, int indexNumber) 
     return indexNsHash % (1U << 22);
 }
 
-Status IndexConsistency::_throwExceptionIfError() {
+Status IndexConsistency::_canProceed() {
+
+    if (_shouldStopValidation) {
+        return Status(ErrorCodes::NamespaceNotFound, "Background validation was interrupted");
+    }
 
     Database* database = dbHolder().get(_opCtx, _nss.db());
 
@@ -539,6 +540,20 @@ Status IndexConsistency::_throwExceptionIfError() {
 
     // Ensure the collection still exists.
     if (!collection) {
+        return Status(ErrorCodes::NamespaceNotFound,
+                      "The collection was dropped during background validation");
+    }
+
+    OptionalCollectionUUID uuid = collection->uuid();
+
+    // The UUID's don't match, so the collection was dropped.
+    if (uuid && _uuid && (uuid != _uuid)) {
+        return Status(ErrorCodes::NamespaceNotFound,
+                      "The collection was dropped during background validation");
+    }
+
+    // If only one variable has a UUID and the other doesn't the collection was dropped.
+    if ((uuid && !_uuid) || (!uuid && _uuid)) {
         return Status(ErrorCodes::NamespaceNotFound,
                       "The collection was dropped during background validation");
     }

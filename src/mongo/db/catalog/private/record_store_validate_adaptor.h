@@ -52,12 +52,14 @@ class RecordStoreValidateAdaptor : public ValidateAdaptor {
 public:
     RecordStoreValidateAdaptor(OperationContext* opCtx,
                                IndexConsistency* indexConsistency,
+                               NamespaceString nss,
                                ValidateCmdLevel level,
                                IndexCatalog* ic,
                                ValidateResultsMap* irm)
 
         : _opCtx(opCtx),
           _indexConsistency(indexConsistency),
+          _nss(std::move(nss)),
           _level(level),
           _indexCatalog(ic),
           _indexNsResultsMap(irm) {}
@@ -74,6 +76,7 @@ public:
      */
     void traverseIndex(const IndexAccessMethod* iam,
                        const IndexDescriptor* descriptor,
+                       bool background,
                        ValidateResults* results,
                        int64_t* numTraversedKeys);
 
@@ -94,6 +97,7 @@ public:
 private:
     OperationContext* _opCtx;             // Not owned.
     IndexConsistency* _indexConsistency;  // Not owned.
+    const NamespaceString _nss;
     ValidateCmdLevel _level;
     IndexCatalog* _indexCatalog;             // Not owned.
     ValidateResultsMap* _indexNsResultsMap;  // Not owned.

@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/storage/key_string.h"
@@ -49,7 +50,7 @@ enum class ValidationStage { DOCUMENT, INDEX, NONE };
  * The `UPDATE` operation can be seen as two independent operations (`REMOVE` operation followed
  * by an `INSERT` operation).
  */
-enum class ValidationOperation { INSERT, REMOVE };
+enum class ValidationOperation { INSERT, REMOVE, NONE };
 
 /**
  * The IndexConsistency class is used to keep track of the index consistency.
@@ -75,10 +76,7 @@ struct IndexInfo {
     int64_t numLongKeys;
     // The number of records that have a key in their document that referenced back to the
     // this index
-    int64_t numRecords;
-    // Keeps track of how many indexes were removed (-1) and added (+1) after the
-    // point of validity was set for this index.
-    int64_t numExtraIndexKeys;
+    int64_t numRecordKeys;
 };
 
 class IndexConsistency final {
@@ -118,22 +116,25 @@ public:
     /**
      * Return the number of records with keys for the given `indexNs`.
      */
-    int64_t getNumRecords(int indexNumber) const;
+    int64_t getNumRecordKeys(int indexNumber) const;
+
+    /**
+     * Return the number of inserted and removed records before the cursor that happened
+     * during the collection scan.
+     */
+    int64_t getNumRecordChangesBeforeCursor(int64_t* totalDataSize);
+
+    /**
+     * Processes a record that was inserted or removed before the cursor during
+     * the collection scan.
+     */
+    void processRecordBeforeCursor(const RecordId& loc, int size, bool increment);
 
     /**
      * Returns true if any value in the `_indexKeyCount` map is not equal to 0, otherwise
      * return false.
      */
     bool haveEntryMismatch() const;
-
-    /**
-     * Index entries may be added or removed by concurrent writes during the index scan phase,
-     * after establishing the point of validity. We need to account for these additions and
-     * removals so that when we validate the index key count, we also have a pre-image of the
-     * index counts and won't get incorrect results because of the extra index entries we may or
-     * may not have scanned.
-     */
-    int64_t getNumExtraIndexKeys(int indexNumber) const;
 
     /**
      * This is the entry point for the IndexObserver to apply its observed changes
@@ -182,17 +183,6 @@ public:
     ValidationStage getStage() const;
 
     /**
-     * Sets `_lastProcessedRecordId` to `recordId`.
-     */
-    void setLastProcessedRecordId(RecordId recordId);
-
-    /**
-     * Sets `_lastProcessedIndexEntry` to the KeyString of `indexEntry`.
-     */
-    void setLastProcessedIndexEntry(const IndexDescriptor& descriptor,
-                                    const boost::optional<IndexKeyEntry>& indexEntry);
-
-    /**
      * Informs the IndexConsistency instance that the index scan is beginning to scan the index
      * with namespace `indexNs`. This gives us a chance to clean up after the previous index and
      * setup for the new index.
@@ -212,20 +202,26 @@ public:
     int getIndexNumber(const std::string& indexNs);
 
     /**
-     * Returns true if a new snapshot should be accquired.
-     * If the `recordId` is equal to or greater than `_yieldAtRecordId` then we must get
-     * a new snapshot otherwise we will use stale data.
-     * Otherwise we do not need a new snapshot and can continue with the collection scan.
+     * Returns false if a new snapshot should be accquired.
+     * If the `recordId` is equal to or greater than `_yieldAtRecordId` then
+     * a new snapshot must be acquired otherwise stale data will be used.
+     *
+     * If a new snapshot doesn't need to be acquired, the `_lastProcessedRecordId` is set to
+     * `recordId` and returns true, informing that the caller should proceed their cursor.
      */
-    bool shouldGetNewSnapshot(const RecordId recordId) const;
+    bool shouldGetNext(const RecordId recordId);
 
     /**
-     * Returns true if a new snapshot should be accquired.
-     * If the `keyString` is equal to or greater than `_yieldAtIndexEntry` then we must get
-     * a new snapshot otherwise we will use stale data.
-     * Otherwise we do not need a new snapshot and can continue with the index scan.
+     * Returns false if a new snapshot should be accquired.
+     * If the `keyString` is equal to or greater than `_yieldAtIndexEntry` then
+     * a new snapshot must be acquired otherwise stale data will be used.
+     *
+     * If a new snapshot doesn't need to be acquired, the `_lastProcessedIndexEntry` is set to
+     * `keyString` and returns true, informing that the caller should proceed their cursor.
      */
-    bool shouldGetNewSnapshot(const KeyString& keyString) const;
+    bool shouldGetNext(const KeyString& keyString);
+
+    ValidationOperation getYieldOperation();
 
     /**
      * Gives up the lock that the collection is currently held in and requests the
@@ -244,6 +240,11 @@ public:
      */
     void yield();
 
+    /**
+     * Stops the validation by throwing a uassert
+     */
+    void stop();
+
 private:
     OperationContext* _opCtx;
     Collection* _collection;
@@ -251,6 +252,7 @@ private:
     const RecordStore* _recordStore;
     std::unique_ptr<Lock::CollectionLock> _collLk;
     const bool _isBackground;
+    OptionalCollectionUUID _uuid;
     ElapsedTracker _tracker;
 
     // We map the hashed KeyString values to a bucket which contain the count of how many
@@ -262,7 +264,7 @@ private:
     //       are too few index entries.
     //     - If the count is < 0 in the bucket at the end of the validation pass, then there
     //       are too many index entries.
-    std::map<uint32_t, uint32_t> _indexKeyCount;
+    std::map<uint32_t, int64_t> _indexKeyCount;
 
     // Contains the corresponding index number for each index namespace
     std::map<std::string, int> _indexNumber;
@@ -272,6 +274,11 @@ private:
 
     // RecordId of the last processed document during the collection scan.
     boost::optional<RecordId> _lastProcessedRecordId = boost::none;
+
+    // The number of records that were deleted and added before the cursor during the
+    // collection scan.
+    int64_t _numRecordChanges = 0;
+    int64_t _dataSizeChanges = 0;
 
     // KeyString of the last processed index entry during the index scan.
     std::unique_ptr<KeyString> _lastProcessedIndexEntry = nullptr;
@@ -296,6 +303,9 @@ private:
 
     // Only one thread can use the class at a time
     mutable stdx::mutex _classMutex;
+
+    // If true, stops validation when `_canProceed()` is called.
+    bool _shouldStopValidation = false;
 
     /**
      * Given the document's key KeyString, increment the corresponding `_indexKeyCount`
@@ -338,7 +348,7 @@ private:
      * scan we must yield before processing the record. This is a preventive measure so the
      * collection scan doesn't scan stale records.
      */
-    void _setYieldAtRecord_inlock(const RecordId recordId);
+    void _setYieldAtRecordId_inlock(const RecordId recordId);
 
     /**
      * Allows the IndexObserver to set a yield point at the KeyString of `indexEntry` so that
@@ -373,7 +383,7 @@ private:
      * 3) An index was added or removed in the collection being validated.
      * 4) The operation was killed.
      */
-    Status _throwExceptionIfError();
+    Status _canProceed();
 
 };  // IndexConsistency
 }  // namespace mongo

@@ -344,6 +344,8 @@ public:
                                          const IndexDescriptor* descriptor,
                                          const IndexKeyEntry& indexEntry,
                                          const ValidationOperation operation) const = 0;
+
+        virtual void stopBackgroundValidation() const = 0;
     };
 
 private:
@@ -738,13 +740,20 @@ public:
     }
 
     /**
-     * Calls the Inforn function in the IndexObserver if it's hooked.
+     * Calls the Inform function in the IndexObserver if it's hooked.
      */
     inline void informIndexObserver(OperationContext* opCtx,
                                     const IndexDescriptor* descriptor,
                                     const IndexKeyEntry& indexEntry,
                                     const ValidationOperation operation) const {
         return this->_impl().informIndexObserver(opCtx, descriptor, indexEntry, operation);
+    }
+
+    /**
+     * Stops background validation if it was running on the collection.
+     */
+    inline void stopBackgroundValidation() const {
+        return this->_impl().stopBackgroundValidation();
     }
 
 private:

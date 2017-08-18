@@ -170,6 +170,8 @@ void DatabaseImpl::close(OperationContext* opCtx, const std::string& reason) {
 
     for (auto&& pair : _collections) {
         auto* coll = pair.second;
+        // inform IndexConsistency to stop upon coming back.
+        coll->stopBackgroundValidation();
         coll->getCursorManager()->invalidateAll(opCtx, true, reason);
     }
 }
@@ -460,6 +462,9 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     if (!collection) {
         return Status::OK();  // Post condition already met.
     }
+
+    // If background validation is running, stop it.
+    collection->stopBackgroundValidation();
 
     massertNamespaceNotIndex(fullns.toString(), "dropCollection");
 

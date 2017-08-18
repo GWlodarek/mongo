@@ -102,6 +102,27 @@ public:
 
         const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
 
+        // Only one validation per collection can be in progress, the rest wait until the current
+        // one is finished or the operation is interrupted.
+        {
+            stdx::unique_lock<stdx::mutex> lock(_validationMutex);
+            try {
+                while (_validationsInProgress.find(nss.ns()) != _validationsInProgress.end()) {
+                    opCtx->waitForConditionOrInterrupt(_validationNotifier, lock);
+                }
+            } catch (DBException& e) {
+                return appendCommandStatus(result, e.toStatus());
+            }
+
+            _validationsInProgress.insert(nss.ns());
+        }
+
+        ON_BLOCK_EXIT([&] {
+            stdx::lock_guard<stdx::mutex> lock(_validationMutex);
+            _validationsInProgress.erase(nss.ns());
+            _validationNotifier.notify_all();
+        });
+
         const bool full = cmdObj["full"].trueValue();
         const bool scanData = cmdObj["scandata"].trueValue();
 
@@ -162,34 +183,7 @@ public:
             return false;
         }
 
-        // Set it to false forcefully until it is fully implemented.
-        background = false;
-
         result.append("ns", nss.ns());
-
-        // Only one validation per collection can be in progress, the rest wait in order.
-        {
-            stdx::unique_lock<stdx::mutex> lock(_validationMutex);
-            try {
-                while (_validationsInProgress.find(nss.ns()) != _validationsInProgress.end()) {
-                    opCtx->waitForConditionOrInterrupt(_validationNotifier, lock);
-                }
-            } catch (AssertionException& e) {
-                appendCommandStatus(
-                    result,
-                    {ErrorCodes::CommandFailed,
-                     str::stream() << "Exception during validation: " << e.toString()});
-                return false;
-            }
-
-            _validationsInProgress.insert(nss.ns());
-        }
-
-        ON_BLOCK_EXIT([&] {
-            stdx::lock_guard<stdx::mutex> lock(_validationMutex);
-            _validationsInProgress.erase(nss.ns());
-            _validationNotifier.notify_all();
-        });
 
         ValidateResults results;
         Status status =

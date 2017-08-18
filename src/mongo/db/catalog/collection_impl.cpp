@@ -74,6 +74,8 @@
 #include "mongo/rpc/object_check.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
+
 
 namespace mongo {
 
@@ -440,6 +442,13 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
     if (!loc.isOK())
         return loc.getStatus();
 
+    {
+        stdx::lock_guard<stdx::mutex> lock(_indexConsistencyMutex);
+        if (_indexConsistency) {
+            _indexConsistency->processRecordBeforeCursor(loc.getValue(), doc.objsize(), true);
+        }
+    }
+
     for (auto&& indexBlock : indexBlocks) {
         Status status = indexBlock->insert(doc, loc.getValue());
         if (!status.isOK()) {
@@ -500,6 +509,13 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
         RecordId loc = records[recordIndex++].id;
         invariant(RecordId::min() < loc);
         invariant(loc < RecordId::max());
+
+        {
+            stdx::lock_guard<stdx::mutex> lock(_indexConsistencyMutex);
+            if (_indexConsistency) {
+                _indexConsistency->processRecordBeforeCursor(loc, it->doc.objsize(), true);
+            }
+        }
 
         BsonRecord bsonRecord = {loc, &(it->doc)};
         bsonRecords.push_back(bsonRecord);
@@ -571,6 +587,13 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
     _indexCatalog.unindexRecord(opCtx, doc.value(), loc, noWarn, &keysDeleted);
     if (opDebug) {
         opDebug->keysDeleted += keysDeleted;
+    }
+
+    {
+        stdx::lock_guard<stdx::mutex> lock(_indexConsistencyMutex);
+        if (_indexConsistency) {
+            _indexConsistency->processRecordBeforeCursor(loc, doc.value().objsize(), false);
+        }
     }
 
     _recordStore->deleteRecord(opCtx, loc);
@@ -716,6 +739,14 @@ StatusWith<RecordId> CollectionImpl::_updateDocumentWithMove(OperationContext* o
         return newLocation;
     }
 
+    {
+        stdx::lock_guard<stdx::mutex> lock(_indexConsistencyMutex);
+        if (_indexConsistency) {
+            _indexConsistency->processRecordBeforeCursor(
+                newLocation.getValue(), newDoc.objsize(), true);
+        }
+    }
+
     invariant(newLocation.getValue() != oldLocation);
 
     _cursorManager.invalidateDocument(opCtx, oldLocation, INVALIDATION_DELETION);
@@ -725,6 +756,14 @@ StatusWith<RecordId> CollectionImpl::_updateDocumentWithMove(OperationContext* o
     // Remove indexes for old record.
     int64_t keysDeleted;
     _indexCatalog.unindexRecord(opCtx, oldDoc.value(), oldLocation, true, &keysDeleted);
+
+    {
+        stdx::lock_guard<stdx::mutex> lock(_indexConsistencyMutex);
+        if (_indexConsistency) {
+            _indexConsistency->processRecordBeforeCursor(
+                oldLocation, oldDoc.value().objsize(), false);
+        }
+    }
 
     // Remove old record.
     _recordStore->deleteRecord(opCtx, oldLocation);
@@ -1015,6 +1054,14 @@ void CollectionImpl::informIndexObserver(OperationContext* opCtx,
     }
 }
 
+void CollectionImpl::stopBackgroundValidation() const {
+
+    stdx::lock_guard<stdx::mutex> lock(_indexConsistencyMutex);
+    if (_indexConsistency) {
+        _indexConsistency->stop();
+    }
+}
+
 void CollectionImpl::hookIndexObserver(IndexConsistency* consistency) {
     stdx::lock_guard<stdx::mutex> lock(_indexObserverMutex);
     _indexObserver = stdx::make_unique<IndexObserver>(consistency);
@@ -1031,11 +1078,15 @@ using ValidateResultsMap = std::map<std::string, ValidateResults>;
 
 void _validateRecordStore(OperationContext* opCtx,
                           RecordStore* recordStore,
+                          IndexConsistency* indexConsistency,
                           ValidateCmdLevel level,
                           bool background,
+                          NamespaceString nss,
                           RecordStoreValidateAdaptor* indexValidator,
                           ValidateResults* results,
                           BSONObjBuilder* output) {
+
+    log() << "validating records in " << nss;
 
     // Validate RecordStore and, if `level == kValidateFull`, use the RecordStore's validate
     // function.
@@ -1043,6 +1094,7 @@ void _validateRecordStore(OperationContext* opCtx,
         indexValidator->traverseRecordStore(recordStore, level, results, output);
     } else {
         auto status = recordStore->validate(opCtx, level, indexValidator, results, output);
+        indexConsistency->nextStage();
         // RecordStore::validate always returns Status::OK(). Errors are reported through
         // `results`.
         dassert(status.isOK());
@@ -1053,6 +1105,8 @@ void _validateIndexes(OperationContext* opCtx,
                       IndexCatalog* indexCatalog,
                       BSONObjBuilder* keysPerIndex,
                       RecordStoreValidateAdaptor* indexValidator,
+                      IndexConsistency* indexConsistency,
+                      bool background,
                       ValidateCmdLevel level,
                       ValidateResultsMap* indexNsResultsMap,
                       ValidateResults* results) {
@@ -1076,7 +1130,8 @@ void _validateIndexes(OperationContext* opCtx,
         }
 
         if (curIndexResults.valid) {
-            indexValidator->traverseIndex(iam, descriptor, &curIndexResults, &numTraversedKeys);
+            indexValidator->traverseIndex(
+                iam, descriptor, background, &curIndexResults, &numTraversedKeys);
 
             if (checkCounts && (numValidatedKeys != numTraversedKeys)) {
                 curIndexResults.valid = false;
@@ -1098,6 +1153,8 @@ void _validateIndexes(OperationContext* opCtx,
             results->valid = false;
         }
     }
+
+    indexConsistency->nextStage();
 }
 
 void _markIndexEntriesInvalid(ValidateResultsMap* indexNsResultsMap, ValidateResults* results) {
@@ -1117,6 +1174,7 @@ void _markIndexEntriesInvalid(ValidateResultsMap* indexNsResultsMap, ValidateRes
 
 void _validateIndexKeyCount(OperationContext* opCtx,
                             IndexCatalog* indexCatalog,
+                            IndexConsistency* indexConsistency,
                             RecordStore* recordStore,
                             RecordStoreValidateAdaptor* indexValidator,
                             ValidateResultsMap* indexNsResultsMap) {
@@ -1125,10 +1183,11 @@ void _validateIndexKeyCount(OperationContext* opCtx,
     while (indexIterator.more()) {
         IndexDescriptor* descriptor = indexIterator.next();
         ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexNamespace()];
+        int indexNumber = indexConsistency->getIndexNumber(descriptor->indexNamespace());
 
         if (curIndexResults.valid) {
             indexValidator->validateIndexKeyCount(
-                descriptor, recordStore->numRecords(opCtx), curIndexResults);
+                descriptor, indexConsistency->getNumRecordKeys(indexNumber), curIndexResults);
         }
     }
 }
@@ -1188,19 +1247,46 @@ Status CollectionImpl::validate(OperationContext* opCtx,
                                 BSONObjBuilder* output) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IS));
 
+    // A validation on an oplog has to be done in MODE_X.
+    if (background && ns().isOplog()) {
+        log() << "not validating " << ns().toString()
+              << " in the background because it is the oplog";
+        background = false;
+    }
+
+    IndexConsistency indexConsistency(
+        opCtx, _this, ns(), _recordStore, std::move(collLk), background);
+
+    {
+        stdx::lock_guard<stdx::mutex> lock(_indexConsistencyMutex);
+        _indexConsistency = &indexConsistency;
+    }
+
+    hookIndexObserver(&indexConsistency);
+    auto scopeGuard = MakeGuard([this] {
+        unhookIndexObserver();
+        stdx::lock_guard<stdx::mutex> lock(_indexConsistencyMutex);
+        _indexConsistency = nullptr;
+    });
+
     try {
         ValidateResultsMap indexNsResultsMap;
         BSONObjBuilder keysPerIndex;  // not using subObjStart to be exception safe
-        IndexConsistency indexConsistency(
-            opCtx, _this, ns(), _recordStore, std::move(collLk), background);
         RecordStoreValidateAdaptor indexValidator = RecordStoreValidateAdaptor(
-            opCtx, &indexConsistency, level, &_indexCatalog, &indexNsResultsMap);
-
+            opCtx, &indexConsistency, ns(), level, &_indexCatalog, &indexNsResultsMap);
 
         // Validate the record store
         log(LogComponent::kIndex) << "validating collection " << ns().toString() << endl;
-        _validateRecordStore(
-            opCtx, _recordStore, level, background, &indexValidator, results, output);
+
+        _validateRecordStore(opCtx,
+                             _recordStore,
+                             &indexConsistency,
+                             level,
+                             background,
+                             ns(),
+                             &indexValidator,
+                             results,
+                             output);
 
         // Validate indexes and check for mismatches.
         if (results->valid) {
@@ -1208,6 +1294,8 @@ Status CollectionImpl::validate(OperationContext* opCtx,
                              &_indexCatalog,
                              &keysPerIndex,
                              &indexValidator,
+                             &indexConsistency,
+                             background,
                              level,
                              &indexNsResultsMap,
                              results);
@@ -1219,8 +1307,12 @@ Status CollectionImpl::validate(OperationContext* opCtx,
 
         // Validate index key count.
         if (results->valid) {
-            _validateIndexKeyCount(
-                opCtx, &_indexCatalog, _recordStore, &indexValidator, &indexNsResultsMap);
+            _validateIndexKeyCount(opCtx,
+                                   &_indexCatalog,
+                                   &indexConsistency,
+                                   _recordStore,
+                                   &indexValidator,
+                                   &indexNsResultsMap);
         }
 
         // Report the validation results for the user to see
@@ -1234,7 +1326,15 @@ Status CollectionImpl::validate(OperationContext* opCtx,
             log(LogComponent::kIndex) << "validated collection " << ns().toString() << endl;
         }
     } catch (DBException& e) {
-        if (ErrorCodes::isInterruption(e.code())) {
+        if (ErrorCodes::NamespaceNotFound == e.code()) {
+            // Don't unhook the IndexObserver if the Namespace was not found because either the
+            // database or collection was dropped and CollectionImpl is non-existent anymore.
+            scopeGuard.Dismiss();
+            return e.toStatus();
+        }
+
+        if (ErrorCodes::isInterruption(ErrorCodes::Error(e.code())) ||
+            ErrorCodes::IndexModified == e.code()) {
             return e.toStatus();
         }
         string err = str::stream() << "exception during index validation: " << e.toString();

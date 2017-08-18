@@ -34,12 +34,19 @@ function validateCollections(db, obj) {
         filter = {$or: [filter, {type: {$exists: false}}]};
     }
 
+    var background = false;
+    if (jsTest.options().useBackgroundValidation) {
+        // Cannot run a full validation in background validation.
+        full = false;
+        background = true;
+    }
+
     let collInfo = db.getCollectionInfos(filter);
     for (var collDocument of collInfo) {
         var coll = db.getCollection(collDocument["name"]);
-        var res = coll.validate(full);
+        var res = coll.validate({full: full, background: background});
 
-        if (!res.ok || !res.valid) {
+        if ((!background && (!res.ok || !res.valid)) || (background && res.ok && !res.valid)) {
             if (jsTest.options().skipValidationOnNamespaceNotFound &&
                 res.errmsg === 'ns not found') {
                 // During a 'stopStart' backup/restore on the secondary node, the actual list of
